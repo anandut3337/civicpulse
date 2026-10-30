@@ -1,0 +1,50 @@
+# Render Blueprint: New > Blueprint > pick this repo. Backend only (the repo contains no frontend).
+services:
+  - type: web
+    name: civicpulse-api
+    runtime: node
+    plan: free
+    region: singapore
+    healthCheckPath: /health/ready
+    # --include=dev: Render sets NODE_ENV=production, which would otherwise skip typescript/prisma needed to build.
+    buildCommand: npm install --include=dev && npm run build
+    # Syncs the schema through DIRECT_URL, then boots. See README "Deploy" for the migrations caveat.
+    startCommand: npm run start:render
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DATABASE_URL
+        sync: false
+      - key: DIRECT_URL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.6-flash
+      - key: CLIENT_URL
+        sync: false
+      - key: PUBLIC_API_URL
+        sync: false
+      - key: DEFAULT_CITY_HANDLE
+        sync: false
+      - key: DEFAULT_DEPARTMENT_CODE
+        value: PWD
+      # Render disk is ephemeral: use object storage in production.
+      - key: STORAGE_DRIVER
+        value: s3
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_REGION
+        sync: false
+      - key: S3_ENDPOINT
+        sync: false
+      - key: S3_PUBLIC_BASE_URL
+        sync: false
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false

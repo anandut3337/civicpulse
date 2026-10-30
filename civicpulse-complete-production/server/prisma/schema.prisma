@@ -1,0 +1,219 @@
+// =============================================================================
+// CivicPulse - Prisma schema (PostgreSQL)
+// =============================================================================
+// Design notes
+//  * UUID primary keys: safe to expose in URLs, no enumeration attacks.
+//  * Tables are snake_case plural via @@map; columns stay camelCase.
+//  * Location is a self-referencing hierarchy:
+//        WARD   row -> colonyName = null, parentId = null
+//        COLONY row -> colonyName set,    parentId = <ward row id>
+//    State -> District -> City are denormalised columns on every row (cheap
+//    filtering, no join explosion). `assignedWardId` / `wardId` always point at
+//    a WARD-level row. Issues point at the most precise row available
+//    (COLONY preferred). Migrate to PostGIS polygons when boundaries are ready.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL") // pooled connection (Supabase pgbouncer, port 6543) used at runtime
+  directUrl = env("DIRECT_URL")   // direct/session connection (port 5432) used by prisma migrate / db push
+}
+
+// ----------------------------------------------------------------------------
+// Enums
+// ----------------------------------------------------------------------------
+
+enum Role {
+  CITIZEN
+  OFFICIAL
+  ADMIN
+}
+
+enum IssueStatus {
+  PENDING
+  IN_PROGRESS
+  RESOLVED
+  REJECTED
+}
+
+enum IssueUrgency {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+// ----------------------------------------------------------------------------
+// Users
+// ----------------------------------------------------------------------------
+
+model User {
+  id             String   @id @default(uuid())
+  fullName       String
+  email          String   @unique
+  phone          String   @unique
+  // bcrypt hash. Never selected by default in queries that return a user to a client.
+  password       String
+  role           Role     @default(CITIZEN)
+
+  // Only populated for role = OFFICIAL (enforced in the service layer).
+  departmentId   String?
+  assignedWardId String?
+
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  department     Department? @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  assignedWard   Location?   @relation("OfficialAssignedWard", fields: [assignedWardId], references: [id], onDelete: SetNull)
+
+  issues         Issue[]
+  upvotes        IssueUpvote[]
+
+  @@index([role])
+  @@index([departmentId, assignedWardId])
+  @@map("users")
+}
+
+// ----------------------------------------------------------------------------
+// Locations (hierarchical ward system)
+// ----------------------------------------------------------------------------
+
+model Location {
+  id         String  @id @default(uuid())
+  state      String
+  district   String
+  city       String
+  wardName   String
+  wardNumber String  // String, not Int: real-world wards are often "12A", "7-B"
+  colonyName String? // null => this row represents the ward itself
+  zipCode    String
+  latitude   Float   // centroid of the ward / colony
+  longitude  Float
+
+  parentId   String?
+  parent     Location?  @relation("WardColonies", fields: [parentId], references: [id], onDelete: Restrict)
+  colonies   Location[] @relation("WardColonies")
+
+  createdAt  DateTime @default(now())
+
+  assignedOfficials User[]           @relation("OfficialAssignedWard")
+  issues            Issue[]
+  officialHandles   OfficialHandle[] @relation("WardHandles")
+
+  // NOTE: Postgres treats NULLs as distinct, so ward-level rows (colonyName =
+  // null) are NOT deduplicated by this constraint. The seed/admin service must
+  // guard ward-level uniqueness; colony rows are fully protected.
+  @@unique([state, district, city, wardNumber, colonyName])
+  @@index([state, district, city])
+  @@index([state, district, city, wardNumber])
+  @@index([zipCode])
+  @@index([latitude, longitude]) // bounding-box prefilter for coordinate resolution
+  @@index([parentId])
+  @@map("locations")
+}
+
+// ----------------------------------------------------------------------------
+// Departments
+// ----------------------------------------------------------------------------
+
+model Department {
+  id           String   @id @default(uuid())
+  name         String   @unique // e.g. "Roads / PWD"
+  code         String   @unique // stable machine key e.g. "PWD", "ELEC"
+  contactEmail String
+  createdAt    DateTime @default(now())
+
+  users           User[]
+  issues          Issue[]
+  officialHandles OfficialHandle[]
+
+  @@map("departments")
+}
+
+// ----------------------------------------------------------------------------
+// Issues / Complaints
+// ----------------------------------------------------------------------------
+
+model Issue {
+  id           String       @id @default(uuid())
+  title        String
+  description  String       @db.Text
+  mediaUrls    String[]     @default([]) // object-storage URLs (S3/GCS/Cloudinary)
+  status       IssueStatus  @default(PENDING)
+  urgency      IssueUrgency @default(MEDIUM)
+
+  // Exact GPS pin submitted by the citizen (locationId is the mapped locality).
+  latitude     Float?
+  longitude    Float?
+
+  upvotesCount Int          @default(0) // denormalised counter, kept in sync with IssueUpvote
+  resolvedAt   DateTime?
+
+  // --- AI inspection (Gemini). Null when the AI was unavailable (fallback routing). ---
+  aiSummary           String?  // one-sentence defect description; also feeds the tweet draft
+  aiConfidence        Float?   // 0..1
+  aiFlaggedIrrelevant Boolean  @default(false) // model thought it may not be a civic issue (citizen overrode)
+  aiModel             String?  // audit trail: which model produced the verdict
+
+  userId       String
+  locationId   String
+  departmentId String
+
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Restrict)
+  location     Location     @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  department   Department   @relation(fields: [departmentId], references: [id], onDelete: Restrict)
+  upvotes      IssueUpvote[]
+
+  // Index set tuned for the official dashboard + public feed queries.
+  @@index([departmentId, status])
+  @@index([locationId, status])
+  @@index([status, urgency])
+  @@index([userId])
+  @@index([createdAt])
+  @@index([upvotesCount])
+  @@map("issues")
+}
+
+// One upvote per user per issue (prevents double-counting).
+model IssueUpvote {
+  id        String   @id @default(uuid())
+  issueId   String
+  userId    String
+  createdAt DateTime @default(now())
+
+  issue     Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([issueId, userId])
+  @@index([userId])
+  @@map("issue_upvotes")
+}
+
+// ----------------------------------------------------------------------------
+// Official Handles (social accountability mapping)
+// ----------------------------------------------------------------------------
+
+model OfficialHandle {
+  id            String   @id @default(uuid())
+  wardId        String   // WARD-level Location row
+  departmentId  String
+  officialTitle String   // "SP", "DSP", "Ward Councillor", "MLA", ...
+  twitterHandle String?  // stored WITHOUT the leading '@'
+  contactPhone  String?
+  createdAt     DateTime @default(now())
+
+  ward          Location   @relation("WardHandles", fields: [wardId], references: [id], onDelete: Cascade)
+  department    Department @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+
+  @@unique([wardId, departmentId, officialTitle])
+  @@index([wardId, departmentId])
+  @@map("official_handles")
+}
